@@ -1,23 +1,25 @@
 /**
- * Helium Gateway Mapper - LoRaManager DEBUG VERSION  
+ * Helium Gateway Mapper - LoRaManager REAL GPS VERSION  
  * 
  * Hardware: Heltec Wireless Tracker V1.1 (ESP32-S3 + SX1262)
  * Network: US915 LoRaWAN via Helium Network -> ChirpStack
  * Library: LoRaManager (RadioLib wrapper)
  * 
- * DEBUG: Skips GPS, sends test data to verify LoRaWAN pipeline
+ * REAL GPS: Uses TinyGPSPlus to get actual coordinates for gateway mapping
  */
 
 #include <Arduino.h>
 #include <LoRaManager.h>
 #include <esp_adc_cal.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
 #include "secrets.h"
 
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
 #define FIRMWARE_VERSION_MAJOR 3
-#define FIRMWARE_VERSION_MINOR 1
+#define FIRMWARE_VERSION_MINOR 2
 
 // ============================================================================
 // HARDWARE CONFIGURATION
@@ -29,13 +31,23 @@
 #define LORA_DIO1   14  // DIO1 (IRQ)
 #define LORA_BUSY   13  // BUSY (SX1262 specific)
 
+// GPS Pin Definitions (Heltec Wireless Tracker V1.1)
+#define GPS_RX      43  // GPS RX (V1.1 specific)
+#define GPS_TX      44  // GPS TX (V1.1 specific)  
+#define GPS_POWER   3   // GPS Power Control (V1.1 critical)
+
+// LED Pin Definition (Heltec Wireless Tracker V1.1)
+#define LED_BUILTIN 35  // Built-in LED for Heltec V1.1
+
 // Battery monitoring  
 #define BATTERY_ADC ADC1_CHANNEL_5  // GPIO13 (same as LORA_BUSY - we'll read when radio is idle)
 #define BATTERY_VOLTAGE_DIVIDER 2.0f // Adjust based on your board
 
 // Timing constants
-#define TRANSMISSION_INTERVAL_MS 60000  // 1 minute for debugging
-#define JOIN_TIMEOUT_MS 60000          // 1 minute join timeout
+#define TRANSMISSION_INTERVAL_MS 300000  // 5 minutes for real deployment
+#define JOIN_TIMEOUT_MS 60000           // 1 minute join timeout
+#define GPS_TIMEOUT_MS 60000            // 1 minute GPS timeout
+#define GPS_BAUD_RATE 9600              // Standard GPS baud rate
 
 // ============================================================================
 // LORAWAN CONFIGURATION  
@@ -50,20 +62,47 @@ String appKeyHex = "E3EE86C89D7D5FB1FAE4C733E7BED2D8";
 String nwkKeyHex = "E3EE86C89D7D5FB1FAE4C733E7BED2D8";  // Same as AppKey for LoRaWAN 1.0.x
 
 // ============================================================================
+// GPS CONFIGURATION
+// ============================================================================
+
+// GPS hardware
+HardwareSerial gpsSerial(1);  // Use UART1 for GPS
+TinyGPSPlus gps;
+
+// GPS fix quality enum
+enum GPSFixQuality {
+    NO_FIX = 0,
+    GPS_FIX_2D = 1,
+    GPS_FIX_3D = 2,
+    DGPS_FIX = 3
+};
+
+// ============================================================================
 // DATA STRUCTURES
 // ============================================================================
 
-struct TestData {
-    float latitude;           // 4 bytes - TEST DATA
-    float longitude;          // 4 bytes - TEST DATA 
-    uint16_t altitude;        // 2 bytes - TEST DATA
-    uint8_t satellites;       // 1 byte - TEST DATA
-    uint8_t hdop;            // 1 byte - TEST DATA
+struct GPSData {
+    float latitude;           // 4 bytes - REAL GPS DATA
+    float longitude;          // 4 bytes - REAL GPS DATA
+    uint16_t altitude;        // 2 bytes - REAL GPS DATA
+    uint8_t satellites;       // 1 byte - REAL GPS DATA
+    uint8_t hdop;            // 1 byte - REAL GPS DATA (scaled x10)
     uint16_t battery_mv;      // 2 bytes - REAL BATTERY DATA
     uint8_t packet_count;     // 1 byte - REAL COUNTER
     uint8_t firmware_version; // 1 byte - REAL VERSION
-    // Total: 16 bytes
+    // Total: 16 bytes (maintaining compatibility)
 } __attribute__((packed));
+
+// Last known location for fallback
+struct LastKnownLocation {
+    bool valid;
+    float latitude;
+    float longitude;
+    uint16_t altitude;
+    uint8_t satellites;
+    uint8_t hdop;
+    unsigned long timestamp;
+} lastKnownGPS = {false, 0.0, 0.0, 0, 0, 99, 0};
 
 // ============================================================================
 // GLOBAL VARIABLES
@@ -85,12 +124,19 @@ unsigned long lastTransmissionTime = 0;
 void initHardware();
 float readBatteryVoltage();
 
+// GPS
+void initGPS();
+void powerOnGPS();
+void powerOffGPS();
+bool acquireGPSFix(GPSData &data, uint32_t timeoutMs);
+GPSFixQuality getGPSFixQuality();
+
 // LoRaWAN
 bool initLoRaWAN();
 bool joinNetwork();
 
 // Application
-bool createTestDataPacket(uint8_t *buffer, uint8_t &size);
+bool createGPSDataPacket(uint8_t *buffer, uint8_t &size);
 void performDataTransmission();
 
 // ============================================================================
@@ -98,14 +144,19 @@ void performDataTransmission();
 // ============================================================================
 
 void setup() {
+    // Initialize CDC serial and wait for it to be ready (ESP32-S3 fix)
     Serial.begin(115200);
-    delay(3000);
+    while (!Serial) {
+        delay(10);
+    }
+    delay(1000); // Additional delay to ensure CDC is fully ready
     
-    Serial.println("\n=== Helium Gateway Mapper - LoRaManager v3.1 ===");
+    Serial.println("\n=== Helium Gateway Mapper - LoRaManager v3.2 ===");
     Serial.printf("🚀 Firmware: %d.%d\n", FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR);
     Serial.println("📡 Library: LoRaManager (RadioLib wrapper)");
-    Serial.println("🛠️ Board: Heltec Wireless Tracker V1.1 (FIXED!)");
-    Serial.println("🧪 DEBUG MODE: Skipping GPS, sending test data");
+    Serial.println("🛠️ Board: Heltec Wireless Tracker V1.1");
+    Serial.println("🗺️  REAL GPS: TinyGPSPlus for actual coordinates");
+    Serial.println("⚡ ESP32-S3 with USB CDC enabled");
     Serial.println("===============================================");
     
     // Initialize hardware
@@ -113,14 +164,19 @@ void setup() {
     initHardware();
     Serial.println("   ✅ Hardware init complete");
     
+    // Initialize GPS
+    Serial.println("2. 🛰️  Initializing GPS...");
+    initGPS();
+    Serial.println("   ✅ GPS init complete");
+    
     // Initialize LoRaWAN
-    Serial.println("2. 📡 Initializing LoRaWAN...");
+    Serial.println("3. 📡 Initializing LoRaWAN...");
     if (initLoRaWAN()) {
         Serial.println("   ✅ LoRaWAN init complete");
         
-        Serial.println("3. 🤝 Joining network...");
+        Serial.println("4. 🤝 Joining network...");
         if (joinNetwork()) {
-            Serial.println("   🎉 JOIN SUCCESS! Starting data transmission...");
+            Serial.println("   🎉 JOIN SUCCESS! Starting GPS mapping...");
             isJoined = true;
             lastTransmissionTime = millis();
             
@@ -133,7 +189,7 @@ void setup() {
         Serial.println("   ❌ LoRaWAN init failed");
     }
     
-    Serial.println("4. 🔄 Setup complete - entering main loop");
+    Serial.println("5. 🔄 Setup complete - entering main loop");
 }
 
 // ============================================================================
@@ -156,9 +212,9 @@ void loop() {
         return;
     }
     
-    // Send data every minute if joined
+    // Send data every 5 minutes if joined
     if (isJoined && (millis() - lastTransmissionTime) > TRANSMISSION_INTERVAL_MS) {
-        Serial.println("\n📡 Starting periodic transmission...");
+        Serial.println("\n📡 Starting periodic GPS transmission...");
         performDataTransmission();
         lastTransmissionTime = millis();
     }
@@ -181,6 +237,10 @@ void initHardware() {
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, HIGH); // LED on during init
     
+    // Initialize GPS power control
+    pinMode(GPS_POWER, OUTPUT);
+    powerOffGPS(); // Start with GPS off
+    
     // Brief delay for LED
     delay(500);
     digitalWrite(LED_BUILTIN, LOW); // LED off after init
@@ -200,6 +260,94 @@ float readBatteryVoltage() {
     
     float voltage = (voltage_sum / 10.0f) * BATTERY_VOLTAGE_DIVIDER / 1000.0f; // Convert to volts
     return voltage;
+}
+
+// ============================================================================
+// GPS FUNCTIONS
+// ============================================================================
+
+void initGPS() {
+    // Initialize GPS serial communication
+    gpsSerial.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX, GPS_TX);
+    Serial.printf("   📍 GPS UART configured: RX=%d, TX=%d, Baud=%d\n", GPS_RX, GPS_TX, GPS_BAUD_RATE);
+}
+
+void powerOnGPS() {
+    digitalWrite(GPS_POWER, HIGH);  // Turn on GPS power
+    Serial.println("   🔋 GPS powered ON");
+    delay(1000);  // Give GPS time to boot up
+}
+
+void powerOffGPS() {
+    digitalWrite(GPS_POWER, LOW);   // Turn off GPS power
+    Serial.println("   🔋 GPS powered OFF");
+}
+
+bool acquireGPSFix(GPSData &data, uint32_t timeoutMs) {
+    powerOnGPS();
+    
+    unsigned long startTime = millis();
+    bool fixAcquired = false;
+    
+    Serial.printf("   🛰️  Acquiring GPS fix (timeout: %d seconds)...\n", timeoutMs / 1000);
+    
+    while (millis() - startTime < timeoutMs) {
+        while (gpsSerial.available() > 0) {
+            if (gps.encode(gpsSerial.read())) {
+                // Check if we have a valid fix
+                if (gps.location.isValid() && 
+                    gps.location.isUpdated() &&
+                    gps.satellites.isValid() && 
+                    gps.satellites.value() >= 4 &&  // Minimum 4 satellites for good fix
+                    gps.hdop.isValid() && 
+                    gps.hdop.value() < 500) {  // HDOP < 5.0 (stored as x100)
+                    
+                    // Extract GPS data
+                    data.latitude = gps.location.lat();
+                    data.longitude = gps.location.lng();
+                    data.altitude = gps.altitude.isValid() ? (uint16_t)gps.altitude.meters() : 0;
+                    data.satellites = gps.satellites.value();
+                    data.hdop = (uint8_t)(gps.hdop.value() / 10);  // Scale to fit in uint8_t
+                    
+                    // Update last known location
+                    lastKnownGPS.valid = true;
+                    lastKnownGPS.latitude = data.latitude;
+                    lastKnownGPS.longitude = data.longitude;
+                    lastKnownGPS.altitude = data.altitude;
+                    lastKnownGPS.satellites = data.satellites;
+                    lastKnownGPS.hdop = data.hdop;
+                    lastKnownGPS.timestamp = millis();
+                    
+                    fixAcquired = true;
+                    break;
+                }
+            }
+        }
+        if (fixAcquired) break;
+        
+        // Blink LED during GPS acquisition
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+        delay(250);
+    }
+    
+    digitalWrite(LED_BUILTIN, LOW); // Turn off LED
+    powerOffGPS(); // Save power
+    
+    if (fixAcquired) {
+        Serial.printf("   ✅ GPS fix acquired: %.6f, %.6f (%d sats, HDOP: %.1f)\n", 
+                     data.latitude, data.longitude, data.satellites, data.hdop / 10.0f);
+    } else {
+        Serial.println("   ❌ GPS fix timeout - no valid position");
+    }
+    
+    return fixAcquired;
+}
+
+GPSFixQuality getGPSFixQuality() {
+    if (!gps.location.isValid()) return NO_FIX;
+    if (gps.satellites.value() >= 4) return GPS_FIX_3D;
+    if (gps.satellites.value() >= 3) return GPS_FIX_2D;
+    return NO_FIX;
 }
 
 // ============================================================================
@@ -258,15 +406,31 @@ bool joinNetwork() {
 // APPLICATION FUNCTIONS
 // ============================================================================
 
-bool createTestDataPacket(uint8_t *buffer, uint8_t &size) {
-    TestData data;
+bool createGPSDataPacket(uint8_t *buffer, uint8_t &size) {
+    GPSData data;
+    bool usingRealGPS = false;
     
-    // Create test GPS data (simulate San Francisco area)
-    data.latitude = 37.7749f + (packetCounter * 0.0001f);  // Slightly different each time
-    data.longitude = -122.4194f + (packetCounter * 0.0001f);
-    data.altitude = 100 + (packetCounter % 50);  // 100-150m
-    data.satellites = 8 + (packetCounter % 4);   // 8-11 satellites
-    data.hdop = 10 + (packetCounter % 20);       // HDOP 1.0-3.0 (stored as *10)
+    // Try to get real GPS fix
+    if (acquireGPSFix(data, GPS_TIMEOUT_MS)) {
+        usingRealGPS = true;
+        Serial.println("📦 Using REAL GPS data");
+    } else if (lastKnownGPS.valid) {
+        // Use last known location as fallback
+        data.latitude = lastKnownGPS.latitude;
+        data.longitude = lastKnownGPS.longitude;
+        data.altitude = lastKnownGPS.altitude;
+        data.satellites = lastKnownGPS.satellites;
+        data.hdop = lastKnownGPS.hdop;
+        Serial.println("📦 Using LAST KNOWN GPS location");
+    } else {
+        // No GPS data available - send packet with zero coordinates but real battery/device info
+        data.latitude = 0.0f;
+        data.longitude = 0.0f;
+        data.altitude = 0;
+        data.satellites = 0;
+        data.hdop = 99;  // Invalid HDOP to indicate no GPS
+        Serial.println("📦 NO GPS data available - sending status packet");
+    }
     
     // Real battery data
     float batteryV = readBatteryVoltage();
@@ -277,14 +441,18 @@ bool createTestDataPacket(uint8_t *buffer, uint8_t &size) {
     data.firmware_version = (FIRMWARE_VERSION_MAJOR << 4) | FIRMWARE_VERSION_MINOR;
     
     // Copy to buffer
-    memcpy(buffer, &data, sizeof(TestData));
-    size = sizeof(TestData);
+    memcpy(buffer, &data, sizeof(GPSData));
+    size = sizeof(GPSData);
     
-    Serial.printf("📦 Test packet #%d created (%d bytes):\n", packetCounter, size);
-    Serial.printf("   🗺️  GPS: %.4f, %.4f, %dm\n", data.latitude, data.longitude, data.altitude);
-    Serial.printf("   🛰️  Sats: %d, HDOP: %.1f\n", data.satellites, data.hdop / 10.0f);
-    Serial.printf("   🔋 Battery: %dmV, FW: %d.%d\n", 
-                  data.battery_mv, 
+    Serial.printf("📦 GPS packet #%d created (%d bytes):\n", packetCounter, size);
+    if (data.latitude != 0.0f || data.longitude != 0.0f) {
+        Serial.printf("   🗺️  Location: %.6f, %.6f, %dm\n", data.latitude, data.longitude, data.altitude);
+        Serial.printf("   🛰️  Quality: %d sats, HDOP: %.1f\n", data.satellites, data.hdop / 10.0f);
+    } else {
+        Serial.println("   🗺️  Location: NO GPS FIX");
+    }
+    Serial.printf("   🔋 Battery: %dmV (%.2fV), FW: %d.%d\n", 
+                  data.battery_mv, batteryV,
                   (data.firmware_version >> 4) & 0xF, 
                   data.firmware_version & 0xF);
     
@@ -295,15 +463,15 @@ void performDataTransmission() {
     uint8_t buffer[32];
     uint8_t size;
     
-    Serial.println("📡 Starting data transmission...");
+    Serial.println("📡 Starting GPS data transmission...");
     
-    if (createTestDataPacket(buffer, size)) {
+    if (createGPSDataPacket(buffer, size)) {
         packetCounter++;
-        Serial.printf("📤 Sending packet #%d on port 1...\n", packetCounter);
+        Serial.printf("📤 Sending GPS packet #%d on port 1...\n", packetCounter);
         
         // Send unconfirmed data
         if (lora.sendData(buffer, size, 1, false)) {
-            Serial.println("   ✅ Data sent successfully!");
+            Serial.println("   ✅ GPS data sent successfully!");
             
             // Get signal quality
             Serial.printf("   📶 RSSI: %.1f dBm, SNR: %.1f dB\n", 
@@ -315,7 +483,7 @@ void performDataTransmission() {
             digitalWrite(LED_BUILTIN, LOW);
             
         } else {
-            Serial.printf("   ❌ Failed to send data! Error: %d\n", lora.getLastErrorCode());
+            Serial.printf("   ❌ Failed to send GPS data! Error: %d\n", lora.getLastErrorCode());
             
             // Check if we lost network connection
             if (!lora.isNetworkJoined()) {
@@ -324,8 +492,8 @@ void performDataTransmission() {
             }
         }
     } else {
-        Serial.println("   ❌ Failed to create packet");
+        Serial.println("   ❌ Failed to create GPS packet");
     }
     
-    Serial.println("📡 Transmission cycle complete\n");
+    Serial.println("📡 GPS transmission cycle complete\n");
 }
