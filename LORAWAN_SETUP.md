@@ -125,6 +125,8 @@ The device is configured for **US915 FSB2** (channels 8-15 + 65):
 # Upload sketch
 ```
 
+**🚨 hal_failed() Issue RESOLVED**: If you previously encountered crashes during startup, this has been fixed with proper SPI timing and radio reset sequence. The device should now boot cleanly and display initialization messages.
+
 ### 2. First Boot Configuration
 
 1. **Power on device**

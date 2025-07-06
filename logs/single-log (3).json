@@ -1,0 +1,21 @@
+{
+    "time": "2025-07-06T03:10:19.114738151+00:00",
+    "deviceInfo": {
+        "tenantId": "0c6e58d9-cd0d-4ccd-84eb-29899e100fc4",
+        "tenantName": "structuresense",
+        "applicationId": "e846ed91-61de-4605-a1b1-9738d526680d",
+        "applicationName": "StructureSense",
+        "deviceProfileId": "ad56e553-2931-449d-bff0-a7e2b98c710f",
+        "deviceProfileName": "StructureSenseAI - Base Profile",
+        "deviceName": "Gateway Sniffer",
+        "devEui": "bcb959046bf0c8e3",
+        "deviceClassEnabled": "CLASS_A",
+        "tags": {}
+    },
+    "level": "ERROR",
+    "code": "UPLINK_MIC",
+    "description": "MIC of join-request is invalid, make sure keys are correct",
+    "context": {
+        "deduplication_id": "efe1be11-8180-4fde-b4eb-217914cc5317"
+    }
+}

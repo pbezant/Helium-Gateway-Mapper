@@ -1,659 +1,555 @@
 /**
- * Helium Gateway Mapper - LoRaWAN Version
- * 
- * Converts Reticulum-based asset tracker to LoRaWAN for mapping
- * Helium Network gateway coverage using ChirpStack backend.
+ * Helium Gateway Mapper - SX126x-Arduino Implementation
  * 
  * Hardware: Heltec Wireless Tracker V1.1 (ESP32-S3 + SX1262)
  * Network: US915 LoRaWAN via Helium Network -> ChirpStack
  * 
- * Based on original Reticulum tracker by Akita
- * LoRaWAN conversion for gateway mapping use case
+ * Library: SX126x-Arduino by beegee-tokyo (native SX1262 support)
+ * Eliminates hal_failed() crashes with proper BUSY pin handling
  */
 
 #include <Arduino.h>
-#include <lmic.h>
-#include <hal/hal.h>
-#include <SPI.h>
+#include <SX126x-Arduino.h>
+#include <LoRaWan-Arduino.h>
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <esp_sleep.h>
-#include <esp_pm.h>
-#include <driver/adc.h>
 #include "secrets.h"
 
 // ============================================================================
-// FIRMWARE VERSION & BUILD INFO
+// FIRMWARE VERSION
 // ============================================================================
-#ifndef FIRMWARE_VERSION_MAJOR
-#define FIRMWARE_VERSION_MAJOR 2
-#endif
-#ifndef FIRMWARE_VERSION_MINOR  
-#define FIRMWARE_VERSION_MINOR 0
-#endif
-
-const char* FIRMWARE_VERSION_STRING = "v2.0-LoRaWAN";
-const char* BUILD_TARGET = "Helium Gateway Mapper";
+#define FW_VERSION "1.0.0"
 
 // ============================================================================
-// HARDWARE PIN DEFINITIONS - Heltec Wireless Tracker V1.1
+// HARDWARE DEFINITIONS (Heltec Wireless Tracker V1.1)
 // ============================================================================
+// SX1262 LoRa pins
+#define LORA_CS      8    // NSS (Chip Select)
+#define LORA_RST     12   // Reset
+#define LORA_DIO1    14   // DIO1 (IRQ)
+#define LORA_BUSY    13   // BUSY pin (critical for SX1262)
+#define LORA_SCLK    9    // SPI Clock
+#define LORA_MISO    11   // SPI MISO
+#define LORA_MOSI    10   // SPI MOSI
 
-// LoRa SX1262 Pin Mapping
-#define LORA_CS     8     // SX1262 NSS
-#define LORA_RST    12    // SX1262 RESET  
-#define LORA_DIO1   14    // SX1262 DIO1 (IRQ)
-#define LORA_SCK    9     // SPI Clock
-#define LORA_MISO   11    // SPI MISO
-#define LORA_MOSI   10    // SPI MOSI
-#define LORA_BUSY   13    // SX1262 BUSY
+// GPS pins (V1.1 specific)
+#define GPS_RX       43   // GPS UART RX
+#define GPS_TX       44   // GPS UART TX
+#define GPS_POWER    3    // GPS power control (V1.1 specific)
 
-// GPS UART (UC6580 GNSS)
-#define GPS_TX      44    // GPS TX (connect to ESP32 RX) - V1.1 specific
-#define GPS_RX      43    // GPS RX (connect to ESP32 TX) - V1.1 specific  
-#define GPS_BAUD    9600
-
-// Power Management
-#define GPS_POWER   3     // GPS Power Control (V1.1 CRITICAL: GPIO3)
-#define VEXT_CTRL   36    // Vext control for external peripherals
-#define BATTERY_ADC 1     // ADC1_CH0 for battery voltage
-
-// Status LED
-#define LED_PIN     35    // Status LED
+// Status LEDs (remove duplicate definition)
+// #define LED_BUILTIN  35  // Already defined in board variant
 
 // ============================================================================
 // LORAWAN CONFIGURATION
 // ============================================================================
+// Region and frequency band
+#define LORAWAN_REGION    LORAMAC_REGION_US915
+#define LORAWAN_SUBBAND   2  // US915 FSB2 (channels 8-15 + 65) for Helium
 
-// OTAA Keys are now defined in secrets.h
-// Configure your actual device keys there (see secrets.h.example for format)
+// Device configuration
+#define LORAWAN_CLASS     CLASS_A
+#define LORAWAN_ADR       true
+#define LORAWAN_PUBLIC    true
+#define LORAWAN_DUTY_CYCLE false
+#define LORAWAN_DATARATE  DR_3
+#define LORAWAN_TX_POWER  14  // dBm
+#define LORAWAN_CONFIRMED false
 
-// LMIC callbacks
-void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8); }
-void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8); }
-void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16); }
-
-// LoRaWAN pin mapping for LMIC - SX1262 Configuration
-const lmic_pinmap lmic_pins = {
-    .nss = LORA_CS,
-    .rxtx = LMIC_UNUSED_PIN,
-    .rst = LORA_RST,
-    .dio = {LORA_DIO1, LMIC_UNUSED_PIN, LMIC_UNUSED_PIN},
-    .rxtx_rx_active = 0,
-    .rssi_cal = 8,
-    .spi_freq = 8000000,
-};
+// Timing
+#define SEND_INTERVAL     120000  // 2 minutes
+#define JOIN_RETRY_DELAY  30000   // 30 seconds
 
 // ============================================================================
-// GPS & DATA STRUCTURES
+// GLOBAL OBJECTS
 // ============================================================================
-
+// GPS
 TinyGPSPlus gps;
 SoftwareSerial gpsSerial(GPS_RX, GPS_TX);
 
-// Asset data structure - keeps same format as original
-struct AssetData {
-    double latitude;
-    double longitude;
-    double altitude;
-    uint32_t timestamp;
-    float batteryVoltage;
-    uint8_t satellites;
-    float hdop;
-    bool validFix;
-};
-
-// ============================================================================
-// CONFIGURATION & STATE MANAGEMENT
-// ============================================================================
-
+// Storage
 Preferences preferences;
 
-// Configuration parameters (stored in NVS)
-uint32_t sleepTimeSeconds = 300;        // 5 minutes default
-uint32_t gpsTimeoutSeconds = 60;        // 1 minute GPS timeout
-bool enableUnconfirmedUplinks = true;   // Use unconfirmed for mapping
-uint8_t spreadingFactor = 7;            // SF7 for balance of range/battery
-uint8_t txPower = 14;                   // 14 dBm (max for most regions)
+// Hardware configuration for SX126x-Arduino
+hw_config hwConfig;
 
-// Runtime state
-static osjob_t sendjob;
-static bool joined = false;
-static bool txComplete = false;
-static uint16_t sequenceNumber = 0;
-AssetData lastValidReading;
-
-// ============================================================================
-// LED STATUS INDICATION
-// ============================================================================
-
-enum class LedState {
-    OFF,
-    ON,
-    BLINK_SLOW,      // Searching for GPS
-    BLINK_FAST,      // Joining network
-    BLINK_DOUBLE,    // Transmitting
-    BLINK_ERROR      // Error state
+// LoRaWAN parameters
+lmh_param_t lora_param_init = {
+    LORAWAN_ADR,
+    LORAWAN_DATARATE,
+    LORAWAN_PUBLIC,
+    3,  // Join trials
+    LORAWAN_TX_POWER,
+    LORAWAN_DUTY_CYCLE
 };
 
-LedState currentLedState = LedState::OFF;
-unsigned long lastLedUpdate = 0;
-bool ledPhysicalState = false;
+// Device credentials (from secrets.h)
+uint8_t nodeDeviceEUI[8];
+uint8_t nodeAppEUI[8]; 
+uint8_t nodeAppKey[16];
 
-void updateLed() {
-    unsigned long now = millis();
-    bool shouldChange = false;
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+struct GPSData {
+    float latitude = 0.0;
+    float longitude = 0.0;
+    float altitude = 0.0;
+    float hdop = 0.0;
+    uint8_t satellites = 0;
+    bool valid = false;
+};
+
+struct TrackerState {
+    GPSData gps;
+    float batteryVoltage = 0.0;
+    uint32_t lastTransmission = 0;
+    bool joined = false;
+    bool transmissionActive = false;
+    uint32_t transmissionStartTime = 0;
+    uint16_t packetCounter = 0;
+    uint8_t joinRetries = 0;
+} state;
+
+// ============================================================================
+// FUNCTION DECLARATIONS
+// ============================================================================
+// Hardware
+void initHardware();
+void initGPS();
+void initLoRa();
+void controlPeripherals(bool enable);
+
+// GPS
+bool readGPS();
+void powerGPS(bool enable);
+
+// Power
+float readBatteryVoltage();
+
+// LoRaWAN
+void startJoinProcedure();
+bool createDataPacket(uint8_t* buffer, uint8_t* size);
+
+// Status
+void updateLED();
+void printStatus();
+
+// LoRaWAN callback implementations (Board functions provided by SX126x-Arduino library)
+void lorawan_rx_handler(lmh_app_data_t *app_data);
+void lorawan_has_joined_handler(void);
+void lorawan_confirm_class_handler(DeviceClass_t Class);
+void lorawan_join_failed_handler(void);
+void lorawan_unconfirmed_finished(void);
+void lorawan_confirmed_finished(bool result);
+
+// ============================================================================
+// LORAWAN CALLBACKS
+// ============================================================================
+static lmh_callback_t lora_callbacks = {
+    BoardGetBatteryLevel,
+    BoardGetUniqueId, 
+    BoardGetRandomSeed,
+    lorawan_rx_handler,
+    lorawan_has_joined_handler,
+    lorawan_confirm_class_handler,
+    lorawan_join_failed_handler,
+    lorawan_unconfirmed_finished,
+    lorawan_confirmed_finished
+};
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
     
-    switch(currentLedState) {
-        case LedState::OFF:
-            if (ledPhysicalState) {
-                digitalWrite(LED_PIN, LOW);
-                ledPhysicalState = false;
-            }
-            break;
-            
-        case LedState::ON:
-            if (!ledPhysicalState) {
-                digitalWrite(LED_PIN, HIGH);
-                ledPhysicalState = true;
-            }
-            break;
-            
-        case LedState::BLINK_SLOW:
-            if (now - lastLedUpdate > 1000) {
-                shouldChange = true;
-            }
-            break;
-            
-        case LedState::BLINK_FAST:
-            if (now - lastLedUpdate > 200) {
-                shouldChange = true;
-            }
-            break;
-            
-        case LedState::BLINK_DOUBLE:
-            // Double blink pattern: ON-OFF-ON-OFF-pause
-            if (now - lastLedUpdate > 100) {
-                shouldChange = true;
-            }
-            break;
-            
-        case LedState::BLINK_ERROR:
-            if (now - lastLedUpdate > 100) {
-                shouldChange = true;
-            }
-            break;
+    Serial.println("=====================================");
+    Serial.println("   Helium Gateway Mapper - SX126x");
+    Serial.println("=====================================");
+    Serial.printf("Firmware: %s\n", FW_VERSION);
+    Serial.printf("Target: Heltec Wireless Tracker V1.1\n");
+    Serial.printf("Chip: ESP32-S3 + SX1262\n");
+    Serial.println("=====================================");
+
+    // Initialize hardware
+    initHardware();
+    
+    // Initialize GPS
+    initGPS();
+    
+    // Initialize LoRa/LoRaWAN
+    initLoRa();
+    
+    // Print initial status
+    printStatus();
+    
+    // Start join procedure if not already joined
+    if (!state.joined) {
+        Serial.println("Starting LoRaWAN join procedure...");
+        startJoinProcedure();
     }
     
-    if (shouldChange) {
-        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-        ledPhysicalState = !ledPhysicalState;
-        lastLedUpdate = now;
-    }
-}
-
-void setLedState(LedState state) {
-    currentLedState = state;
-    lastLedUpdate = millis();
+    Serial.println("Setup complete. Entering main loop...");
 }
 
 // ============================================================================
-// POWER MANAGEMENT
+// MAIN LOOP
 // ============================================================================
-
-void controlPeripherals(bool powerOn) {
-    // GPS Power Control (V1.1 CRITICAL) - HIGH = ON for GPS
-    digitalWrite(GPS_POWER, powerOn ? HIGH : LOW);
+void loop() {
+    // Update GPS data
+    readGPS();
     
-    // Vext control: LOW = ON, HIGH = OFF (inverted logic for external peripherals)
-    digitalWrite(VEXT_CTRL, powerOn ? LOW : HIGH);
+    // Update battery voltage
+    state.batteryVoltage = readBatteryVoltage();
     
-    if (powerOn) {
-        delay(200); // Allow power to stabilize (GPS needs more time)
-        Serial.println("Peripherals powered ON (GPS + Vext)");
-    } else {
-        Serial.println("Peripherals powered OFF");
+    // Handle transmission timing
+    if (state.joined && !state.transmissionActive) {
+        if (millis() - state.lastTransmission > SEND_INTERVAL) {
+            // Time to send a packet
+            if (state.gps.valid) {
+                uint8_t buffer[32];
+                uint8_t size;
+                
+                if (createDataPacket(buffer, &size)) {
+                    Serial.println("\n--- Sending LoRaWAN Packet ---");
+                    Serial.printf("GPS: %.6f,%.6f Alt:%.1fm HDOP:%.1f Sats:%d\n",
+                        state.gps.latitude, state.gps.longitude, 
+                        state.gps.altitude, state.gps.hdop, state.gps.satellites);
+                    Serial.printf("Battery: %.2fV\n", state.batteryVoltage);
+                    Serial.printf("Packet size: %d bytes\n", size);
+                    
+                    // Prepare packet structure
+                    lmh_app_data_t app_data = {
+                        .buffer = buffer,
+                        .buffsize = size,
+                        .port = 1,
+                        .rssi = 0,
+                        .snr = 0
+                    };
+                    
+                    // Send the packet
+                    lmh_error_status result = lmh_send(&app_data, LMH_UNCONFIRMED_MSG);
+                    if (result == LMH_SUCCESS) {
+                        state.transmissionActive = true;
+                        state.transmissionStartTime = millis();
+                        state.packetCounter++;
+                        Serial.println("Packet queued for transmission");
+                    } else {
+                        Serial.printf("Failed to queue packet: %d\n", result);
+                    }
+                } else {
+                    Serial.println("Failed to create data packet");
+                }
+            } else {
+                Serial.println("Skipping transmission - no valid GPS fix");
+                state.lastTransmission = millis(); // Reset timer
+            }
+        }
     }
+    
+    // Handle join retry timing
+    if (!state.joined && (millis() > JOIN_RETRY_DELAY * (state.joinRetries + 1))) {
+        Serial.printf("Join retry %d...\n", state.joinRetries + 1);
+        startJoinProcedure();
+        state.joinRetries++;
+        
+        if (state.joinRetries >= 10) {
+            Serial.println("Too many join failures, restarting...");
+            ESP.restart();
+        }
+    }
+    
+    // Handle transmission timeout
+    if (state.transmissionActive && (millis() - state.transmissionStartTime > 30000)) {
+        Serial.println("Transmission timeout, resetting state");
+        state.transmissionActive = false;
+        state.lastTransmission = millis();
+    }
+    
+    // Update status LED
+    updateLED();
+    
+    // Brief delay to prevent watchdog issues
+    delay(100);
 }
 
-float readBatteryVoltage() {
-    // Heltec Wireless Tracker has voltage divider on battery
-    // Typical scaling: 3.3V ADC reading = ~4.2V battery (adjust as needed)
-    uint16_t adcValue = analogRead(BATTERY_ADC);
-    float voltage = (adcValue / 4095.0) * 3.3 * 2.0; // 2.0 is voltage divider factor
-    return voltage;
+// ============================================================================
+// HARDWARE INITIALIZATION
+// ============================================================================
+void initHardware() {
+    Serial.println("Initializing hardware...");
+    
+    // Configure LED
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+    
+    // Initialize preferences
+    preferences.begin("tracker", false);
+    
+    // Control peripherals (start with GPS on for initial fix)
+    controlPeripherals(true);
+    
+    Serial.println("Hardware initialization complete");
+}
+
+void initGPS() {
+    Serial.println("Initializing GPS...");
+    
+    // Power on GPS
+    powerGPS(true);
+    delay(100);
+    
+    // Start GPS serial
+    gpsSerial.begin(9600);
+    
+    Serial.println("GPS initialization complete");
+}
+
+void initLoRa() {
+    Serial.println("Initializing LoRa/LoRaWAN...");
+    
+    // Initialize device credentials from secrets.h
+    memcpy(nodeDeviceEUI, DEVEUI, 8);
+    memcpy(nodeAppEUI, APPEUI, 8);
+    memcpy(nodeAppKey, APPKEY, 16);
+    
+    // Configure hardware for SX126x-Arduino library
+    hwConfig.CHIP_TYPE = SX1262_CHIP;
+    hwConfig.PIN_LORA_RESET = LORA_RST;
+    hwConfig.PIN_LORA_NSS = LORA_CS;
+    hwConfig.PIN_LORA_SCLK = LORA_SCLK;
+    hwConfig.PIN_LORA_MISO = LORA_MISO;
+    hwConfig.PIN_LORA_DIO_1 = LORA_DIO1;
+    hwConfig.PIN_LORA_BUSY = LORA_BUSY;
+    hwConfig.PIN_LORA_MOSI = LORA_MOSI;
+    hwConfig.RADIO_TXEN = -1;      // Not used on this board
+    hwConfig.RADIO_RXEN = -1;      // Not used on this board
+    hwConfig.USE_DIO2_ANT_SWITCH = false;
+    hwConfig.USE_DIO3_TCXO = true;  // Heltec boards use DIO3 for TCXO
+    hwConfig.USE_DIO3_ANT_SWITCH = false;
+    hwConfig.USE_LDO = false;       // Use DCDC converter
+    hwConfig.USE_RXEN_ANT_PWR = false;
+    
+    // Initialize LoRa hardware
+    if (lora_hardware_init(hwConfig) != 0) {
+        Serial.println("ERROR: LoRa hardware initialization failed!");
+        return;
+    }
+    
+    // Set up credentials
+    lmh_setDevEui(nodeDeviceEUI);
+    lmh_setAppEui(nodeAppEUI);
+    lmh_setAppKey(nodeAppKey);
+    
+    // Initialize LoRaWAN
+    if (lmh_init(&lora_callbacks, lora_param_init, true, LORAWAN_CLASS, LORAWAN_REGION) != LMH_SUCCESS) {
+        Serial.println("ERROR: LoRaWAN initialization failed!");
+        return;
+    }
+    
+    // Set subband for US915 (Helium uses FSB2)
+    if (!lmh_setSubBandChannels(LORAWAN_SUBBAND)) {
+        Serial.println("ERROR: Failed to set subband!");
+        return;
+    }
+    
+    Serial.println("LoRa/LoRaWAN initialization complete");
 }
 
 // ============================================================================
 // GPS FUNCTIONS
 // ============================================================================
-
-bool acquireGpsFix(AssetData* data, uint32_t timeoutMs) {
-    Serial.println("Acquiring GPS fix...");
-    setLedState(LedState::BLINK_SLOW);
+bool readGPS() {
+    bool newData = false;
     
-    unsigned long startTime = millis();
-    bool fixObtained = false;
-    
-    gpsSerial.begin(GPS_BAUD);
-    
-    while (millis() - startTime < timeoutMs && !fixObtained) {
-        updateLed();
-        esp_task_wdt_reset();
-        
-        while (gpsSerial.available() > 0) {
-            if (gps.encode(gpsSerial.read())) {
-                if (gps.location.isValid() && gps.date.isValid() && gps.time.isValid()) {
-                    data->latitude = gps.location.lat();
-                    data->longitude = gps.location.lng();
-                    data->altitude = gps.altitude.meters();
-                    data->satellites = gps.satellites.value();
-                    data->hdop = gps.hdop.hdop();
-                    data->validFix = true;
-                    
-                    // Create timestamp from GPS time
-                    data->timestamp = millis(); // Simplified - use GPS time if needed
-                    
-                    fixObtained = true;
-                    Serial.printf("GPS Fix: %.6f, %.6f, %.1fm, %d sats\n", 
-                                data->latitude, data->longitude, data->altitude, data->satellites);
-                    break;
-                }
-            }
+    while (gpsSerial.available()) {
+        if (gps.encode(gpsSerial.read())) {
+            newData = true;
         }
-        
-        delay(100);
     }
     
-    gpsSerial.end();
-    
-    if (!fixObtained) {
-        Serial.println("GPS fix timeout");
-        data->validFix = false;
+    if (newData && gps.location.isValid()) {
+        state.gps.latitude = gps.location.lat();
+        state.gps.longitude = gps.location.lng();
+        state.gps.altitude = gps.altitude.meters();
+        state.gps.hdop = gps.hdop.hdop();
+        state.gps.satellites = gps.satellites.value();
+        state.gps.valid = true;
+        return true;
     }
     
-    return fixObtained;
+    return false;
 }
 
-// ============================================================================
-// LORAWAN EVENT HANDLING
-// ============================================================================
-
-void onEvent (ev_t ev) {
-    Serial.print(os_getTime());
-    Serial.print(": ");
-    switch(ev) {
-        case EV_SCAN_TIMEOUT:
-            Serial.println(F("EV_SCAN_TIMEOUT"));
-            break;
-        case EV_BEACON_FOUND:
-            Serial.println(F("EV_BEACON_FOUND"));
-            break;
-        case EV_BEACON_MISSED:
-            Serial.println(F("EV_BEACON_MISSED"));
-            break;
-        case EV_BEACON_TRACKED:
-            Serial.println(F("EV_BEACON_TRACKED"));
-            break;
-        case EV_JOINING:
-            Serial.println(F("EV_JOINING"));
-            setLedState(LedState::BLINK_FAST);
-            break;
-        case EV_JOINED:
-            Serial.println(F("EV_JOINED"));
-            joined = true;
-            setLedState(LedState::ON);
-            delay(1000);
-            setLedState(LedState::OFF);
-            
-            // Disable link check validation (for unconfirmed uplinks)
-            LMIC_setLinkCheckMode(0);
-            
-            // Set data rate and TX power
-            LMIC_setDrTxpow(DR_SF7, txPower);
-            
-            Serial.printf("Joined network. DevAddr: %08X\n", LMIC.devaddr);
-            break;
-        case EV_JOIN_FAILED:
-            Serial.println(F("EV_JOIN_FAILED"));
-            setLedState(LedState::BLINK_ERROR);
-            break;
-        case EV_REJOIN_FAILED:
-            Serial.println(F("EV_REJOIN_FAILED"));
-            setLedState(LedState::BLINK_ERROR);
-            break;
-        case EV_TXCOMPLETE:
-            Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
-            txComplete = true;
-            setLedState(LedState::OFF);
-            
-            if (LMIC.txrxFlags & TXRX_ACK)
-                Serial.println(F("Received ack"));
-            if (LMIC.dataLen) {
-                Serial.printf("Received %d bytes of payload\n", LMIC.dataLen);
-                // Handle downlink data if needed
-            }
-            break;
-        case EV_LOST_TSYNC:
-            Serial.println(F("EV_LOST_TSYNC"));
-            break;
-        case EV_RESET:
-            Serial.println(F("EV_RESET"));
-            break;
-        case EV_RXCOMPLETE:
-            Serial.println(F("EV_RXCOMPLETE"));
-            break;
-        case EV_LINK_DEAD:
-            Serial.println(F("EV_LINK_DEAD"));
-            break;
-        case EV_LINK_ALIVE:
-            Serial.println(F("EV_LINK_ALIVE"));
-            break;
-        case EV_TXSTART:
-            Serial.println(F("EV_TXSTART"));
-            setLedState(LedState::BLINK_DOUBLE);
-            break;
-        default:
-            Serial.printf("Unknown event: %d\n", ev);
-            break;
+void powerGPS(bool enable) {
+    digitalWrite(GPS_POWER, enable ? HIGH : LOW);
+    if (enable) {
+        delay(100); // Allow GPS module to stabilize
     }
 }
 
 // ============================================================================
-// DATA TRANSMISSION
+// POWER MANAGEMENT
 // ============================================================================
+void controlPeripherals(bool enable) {
+    // For now, just control GPS power
+    powerGPS(enable);
+}
 
-void sendAssetData(const AssetData& data) {
-    if (!joined) {
-        Serial.println("Not joined to network yet");
-        return;
-    }
-    
-    // Create payload (binary format for efficiency)
-    uint8_t payload[32];
-    uint8_t payloadLen = 0;
-    
-    // GPS coordinates (if valid)
-    if (data.validFix) {
-        // Latitude: 4 bytes (float)
-        float lat = (float)data.latitude;
-        memcpy(&payload[payloadLen], &lat, 4);
-        payloadLen += 4;
-        
-        // Longitude: 4 bytes (float)
-        float lon = (float)data.longitude;
-        memcpy(&payload[payloadLen], &lon, 4);
-        payloadLen += 4;
-        
-        // Altitude: 2 bytes (int16, meters)
-        int16_t alt = (int16_t)data.altitude;
-        payload[payloadLen++] = alt & 0xFF;
-        payload[payloadLen++] = (alt >> 8) & 0xFF;
-        
-        // Satellites: 1 byte
-        payload[payloadLen++] = data.satellites;
-        
-        // HDOP: 1 byte (scaled)
-        payload[payloadLen++] = (uint8_t)(data.hdop * 10);
-    }
-    
-    // Battery voltage: 1 byte (scaled to 0.1V resolution)
-    payload[payloadLen++] = (uint8_t)(data.batteryVoltage * 10);
-    
-    // Sequence number: 2 bytes
-    payload[payloadLen++] = sequenceNumber & 0xFF;
-    payload[payloadLen++] = (sequenceNumber >> 8) & 0xFF;
-    
-    // Status flags: 1 byte
-    uint8_t flags = 0;
-    if (data.validFix) flags |= 0x01;
-    payload[payloadLen++] = flags;
-    
-    // Send unconfirmed uplink
-    if (LMIC.opmode & OP_TXRXPEND) {
-        Serial.println("OP_TXRXPEND, not sending");
-    } else {
-        txComplete = false;
-        LMIC_setTxData2(1, payload, payloadLen, enableUnconfirmedUplinks ? 0 : 1);
-        Serial.printf("Queued %d bytes for transmission\n", payloadLen);
-        sequenceNumber++;
-    }
+float readBatteryVoltage() {
+    // ESP32-S3 ADC reading for battery voltage
+    // This may need calibration based on actual hardware
+    uint32_t raw = analogRead(A0);
+    float voltage = (raw * 3.3 * 2.0) / 4095.0; // Assuming 2:1 voltage divider
+    return voltage;
 }
 
 // ============================================================================
-// CONFIGURATION MANAGEMENT
+// LORAWAN FUNCTIONS
 // ============================================================================
-
-void loadConfiguration() {
-    preferences.begin("gateway_mapper", false);
-    
-    sleepTimeSeconds = preferences.getUInt("sleep_time", 300);
-    gpsTimeoutSeconds = preferences.getUInt("gps_timeout", 60);
-    enableUnconfirmedUplinks = preferences.getBool("unconfirmed", true);
-    spreadingFactor = preferences.getUChar("sf", 7);
-    txPower = preferences.getUChar("tx_power", 14);
-    sequenceNumber = preferences.getUShort("seq_num", 0);
-    
-    preferences.end();
-    
-    Serial.println("Configuration loaded:");
-    Serial.printf("  Sleep time: %d seconds\n", sleepTimeSeconds);
-    Serial.printf("  GPS timeout: %d seconds\n", gpsTimeoutSeconds);
-    Serial.printf("  Unconfirmed uplinks: %s\n", enableUnconfirmedUplinks ? "Yes" : "No");
-    Serial.printf("  Spreading factor: SF%d\n", spreadingFactor);
-    Serial.printf("  TX power: %d dBm\n", txPower);
-    Serial.printf("  Sequence number: %d\n", sequenceNumber);
+void startJoinProcedure() {
+    lmh_join();
+    Serial.println("Join procedure started...");
 }
 
-void saveConfiguration() {
-    preferences.begin("gateway_mapper", false);
-    
-    preferences.putUInt("sleep_time", sleepTimeSeconds);
-    preferences.putUInt("gps_timeout", gpsTimeoutSeconds);
-    preferences.putBool("unconfirmed", enableUnconfirmedUplinks);
-    preferences.putUChar("sf", spreadingFactor);
-    preferences.putUChar("tx_power", txPower);
-    preferences.putUShort("seq_num", sequenceNumber);
-    
-    preferences.end();
-    
-    Serial.println("Configuration saved to NVS");
-}
-
-// ============================================================================
-// SERIAL CONFIGURATION INTERFACE
-// ============================================================================
-
-void handleSerialConfig() {
-    Serial.println("\n=== Helium Gateway Mapper Configuration ===");
-    Serial.println("Commands:");
-    Serial.println("  sleep <seconds>     - Set sleep interval (min 30s)");
-    Serial.println("  gps <seconds>       - Set GPS timeout (10-300s)");
-    Serial.println("  sf <7-12>          - Set spreading factor");
-    Serial.println("  power <2-20>       - Set TX power (dBm)");
-    Serial.println("  confirmed <0|1>    - Enable/disable confirmed uplinks");
-    Serial.println("  show               - Show current settings");
-    Serial.println("  save               - Save settings to NVS");
-    Serial.println("  reboot             - Restart device");
-    Serial.println("  exit               - Exit configuration mode");
-    Serial.println("\nEnter command:");
-    
-    unsigned long configStart = millis();
-    while (millis() - configStart < 30000) { // 30 second timeout
-        if (Serial.available()) {
-            String cmd = Serial.readStringUntil('\n');
-            cmd.trim();
-            
-            if (cmd.equalsIgnoreCase("exit")) {
-                Serial.println("Exiting configuration mode");
-                break;
-            } else if (cmd.startsWith("sleep ")) {
-                uint32_t val = cmd.substring(6).toInt();
-                if (val >= 30) {
-                    sleepTimeSeconds = val;
-                    Serial.printf("Sleep interval set to: %d seconds\n", sleepTimeSeconds);
-                } else {
-                    Serial.println("Error: Sleep interval must be >= 30 seconds");
-                }
-            } else if (cmd.startsWith("gps ")) {
-                uint32_t val = cmd.substring(4).toInt();
-                if (val >= 10 && val <= 300) {
-                    gpsTimeoutSeconds = val;
-                    Serial.printf("GPS timeout set to: %d seconds\n", gpsTimeoutSeconds);
-                } else {
-                    Serial.println("Error: GPS timeout must be 10-300 seconds");
-                }
-            } else if (cmd.startsWith("sf ")) {
-                uint8_t val = cmd.substring(3).toInt();
-                if (val >= 7 && val <= 12) {
-                    spreadingFactor = val;
-                    Serial.printf("Spreading factor set to: SF%d\n", spreadingFactor);
-                } else {
-                    Serial.println("Error: Spreading factor must be 7-12");
-                }
-            } else if (cmd.startsWith("power ")) {
-                uint8_t val = cmd.substring(6).toInt();
-                if (val >= 2 && val <= 20) {
-                    txPower = val;
-                    Serial.printf("TX power set to: %d dBm\n", txPower);
-                } else {
-                    Serial.println("Error: TX power must be 2-20 dBm");
-                }
-            } else if (cmd.startsWith("confirmed ")) {
-                uint8_t val = cmd.substring(10).toInt();
-                enableUnconfirmedUplinks = (val == 0);
-                Serial.printf("Confirmed uplinks: %s\n", enableUnconfirmedUplinks ? "No" : "Yes");
-            } else if (cmd.equalsIgnoreCase("show")) {
-                Serial.println("\nCurrent settings:");
-                Serial.printf("  Sleep time: %d seconds\n", sleepTimeSeconds);
-                Serial.printf("  GPS timeout: %d seconds\n", gpsTimeoutSeconds);
-                Serial.printf("  Spreading factor: SF%d\n", spreadingFactor);
-                Serial.printf("  TX power: %d dBm\n", txPower);
-                Serial.printf("  Confirmed uplinks: %s\n", enableUnconfirmedUplinks ? "No" : "Yes");
-                Serial.printf("  Battery voltage: %.2fV\n", readBatteryVoltage());
-                Serial.printf("  Firmware: %s\n", FIRMWARE_VERSION_STRING);
-            } else if (cmd.equalsIgnoreCase("save")) {
-                saveConfiguration();
-            } else if (cmd.equalsIgnoreCase("reboot")) {
-                Serial.println("Rebooting...");
-                ESP.restart();
-            } else {
-                Serial.println("Unknown command");
-            }
-        }
-        delay(100);
-    }
-}
-
-// ============================================================================
-// MAIN PROGRAM
-// ============================================================================
-
-void setup() {
-    // Initialize serial
-    Serial.begin(115200);
-    delay(2000);
-    
-    Serial.println("\n=== Helium Gateway Mapper ===");
-    Serial.printf("Firmware: %s\n", FIRMWARE_VERSION_STRING);
-    Serial.printf("Target: %s\n", BUILD_TARGET);
-    
-    // Initialize pins
-    pinMode(LED_PIN, OUTPUT);
-    pinMode(GPS_POWER, OUTPUT);   // GPS power control (V1.1 critical)
-    pinMode(VEXT_CTRL, OUTPUT);   // External peripheral power
-    controlPeripherals(false);    // Start with peripherals off
-    
-    // Initialize WDT
-    esp_task_wdt_init(30, true);
-    esp_task_wdt_add(NULL);
-    
-    // Load configuration
-    loadConfiguration();
-    
-    // Check for configuration mode
-    Serial.println("Press any key within 5 seconds to enter configuration mode...");
-    unsigned long configCheck = millis();
-    while (millis() - configCheck < 5000) {
-        if (Serial.available()) {
-            Serial.read(); // Clear buffer
-            handleSerialConfig();
-            break;
-        }
-        delay(100);
+bool createDataPacket(uint8_t* buffer, uint8_t* size) {
+    if (!state.gps.valid) {
+        return false;
     }
     
-    // Initialize SPI for LoRa
-    SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+    // Create binary packet (16 bytes total)
+    // Format: [Lat(4)] [Lon(4)] [Alt(2)] [HDOP(2)] [Sats(1)] [Battery(2)] [Counter(1)]
     
-    // Initialize LMIC
-    os_init();
-    LMIC_reset();
+    int32_t lat = (int32_t)(state.gps.latitude * 1e7);
+    int32_t lon = (int32_t)(state.gps.longitude * 1e7);
+    int16_t alt = (int16_t)(state.gps.altitude);
+    uint16_t hdop = (uint16_t)(state.gps.hdop * 100);
+    uint8_t sats = state.gps.satellites;
+    uint16_t battery = (uint16_t)(state.batteryVoltage * 100);
+    uint8_t counter = state.packetCounter & 0xFF;
     
-    // Configure for US915 with FSB2 (channels 8-15 + 65)
-    LMIC_selectSubBand(1);
+    uint8_t idx = 0;
     
-    // Set initial data rate and TX power
-    LMIC_setDrTxpow(DR_SF7, txPower);
+    // Latitude (4 bytes, little endian)
+    buffer[idx++] = (lat >> 0) & 0xFF;
+    buffer[idx++] = (lat >> 8) & 0xFF;
+    buffer[idx++] = (lat >> 16) & 0xFF;
+    buffer[idx++] = (lat >> 24) & 0xFF;
     
-    // Start joining
-    LMIC_startJoining();
+    // Longitude (4 bytes, little endian)  
+    buffer[idx++] = (lon >> 0) & 0xFF;
+    buffer[idx++] = (lon >> 8) & 0xFF;
+    buffer[idx++] = (lon >> 16) & 0xFF;
+    buffer[idx++] = (lon >> 24) & 0xFF;
     
-    Serial.println("Starting LoRaWAN join procedure...");
-    setLedState(LedState::BLINK_FAST);
+    // Altitude (2 bytes, little endian)
+    buffer[idx++] = (alt >> 0) & 0xFF;
+    buffer[idx++] = (alt >> 8) & 0xFF;
+    
+    // HDOP (2 bytes, little endian)
+    buffer[idx++] = (hdop >> 0) & 0xFF;
+    buffer[idx++] = (hdop >> 8) & 0xFF;
+    
+    // Satellites (1 byte)
+    buffer[idx++] = sats;
+    
+    // Battery voltage (2 bytes, little endian)
+    buffer[idx++] = (battery >> 0) & 0xFF;
+    buffer[idx++] = (battery >> 8) & 0xFF;
+    
+    // Packet counter (1 byte)
+    buffer[idx++] = counter;
+    
+    *size = idx;
+    return true;
 }
 
-void loop() {
-    // Run LMIC scheduler
-    os_runloop_once();
+// ============================================================================
+// STATUS FUNCTIONS
+// ============================================================================
+void updateLED() {
+    static uint32_t lastBlink = 0;
+    static bool ledState = false;
     
-    // Update LED
-    updateLed();
-    
-    // Pet watchdog
-    esp_task_wdt_reset();
-    
-    // Check if we should perform a tracking cycle
-    static unsigned long lastTrackingCycle = 0;
-    if (joined && (millis() - lastTrackingCycle > (sleepTimeSeconds * 1000))) {
-        lastTrackingCycle = millis();
-        
-        Serial.println("Starting tracking cycle...");
-        
-        // Power on GPS and other peripherals
-        controlPeripherals(true);
-        
-        // Acquire GPS data
-        AssetData currentData;
-        currentData.batteryVoltage = readBatteryVoltage();
-        
-        if (acquireGpsFix(&currentData, gpsTimeoutSeconds * 1000)) {
-            lastValidReading = currentData;
-            Serial.println("GPS fix acquired, transmitting data...");
-            sendAssetData(currentData);
+    if (millis() - lastBlink > 1000) {
+        if (state.joined) {
+            // Slow blink when joined
+            digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
+            ledState = !ledState;
         } else {
-            Serial.println("GPS fix failed, transmitting last known location...");
-            currentData = lastValidReading;
-            currentData.batteryVoltage = readBatteryVoltage();
-            currentData.validFix = false;
-            sendAssetData(currentData);
+            // Fast blink when joining
+            digitalWrite(LED_BUILTIN, (millis() / 200) % 2 ? HIGH : LOW);
         }
-        
-        // Wait for transmission to complete
-        while (!txComplete) {
-            os_runloop_once();
-            updateLed();
-            esp_task_wdt_reset();
-            delay(10);
-        }
-        
-        // Power off peripherals
-        controlPeripherals(false);
-        
-        Serial.println("Tracking cycle complete");
+        lastBlink = millis();
     }
-    
-    delay(10);
+}
+
+void printStatus() {
+    Serial.println("\n--- Tracker Status ---");
+    Serial.printf("Joined: %s\n", state.joined ? "Yes" : "No");
+    Serial.printf("GPS Valid: %s\n", state.gps.valid ? "Yes" : "No");
+    if (state.gps.valid) {
+        Serial.printf("GPS: %.6f,%.6f Alt:%.1fm\n", 
+            state.gps.latitude, state.gps.longitude, state.gps.altitude);
+        Serial.printf("HDOP: %.1f Satellites: %d\n", state.gps.hdop, state.gps.satellites);
+    }
+    Serial.printf("Battery: %.2fV\n", state.batteryVoltage);
+    Serial.printf("Packets sent: %d\n", state.packetCounter);
+    Serial.println("---------------------\n");
+}
+
+// ============================================================================
+// LORAWAN CALLBACK IMPLEMENTATIONS  
+// ============================================================================
+// Note: BoardGetBatteryLevel(), BoardGetUniqueId(), and BoardGetRandomSeed() 
+// are provided by the SX126x-Arduino library
+
+void lorawan_rx_handler(lmh_app_data_t *app_data) {
+    Serial.println("LoRa packet received:");
+    Serial.printf("Port: %d\n", app_data->port);
+    Serial.printf("Size: %d\n", app_data->buffsize);
+    Serial.print("Data: ");
+    for (int i = 0; i < app_data->buffsize; i++) {
+        Serial.printf("%02X ", app_data->buffer[i]);
+    }
+    Serial.println();
+}
+
+void lorawan_has_joined_handler(void) {
+    Serial.println("✅ OTAA join succeeded!");
+    state.joined = true;
+    state.joinRetries = 0;
+    state.lastTransmission = millis(); // Reset transmission timer
+    printStatus();
+}
+
+void lorawan_confirm_class_handler(DeviceClass_t Class) {
+    Serial.printf("Class changed to: %c\n", "ABC"[Class]);
+}
+
+void lorawan_join_failed_handler(void) {
+    Serial.println("❌ OTAA join failed");
+    state.joined = false;
+    // Will retry automatically in main loop
+}
+
+void lorawan_unconfirmed_finished(void) {
+    Serial.println("Unconfirmed packet transmission finished");
+    state.transmissionActive = false;
+    state.lastTransmission = millis();
+}
+
+void lorawan_confirmed_finished(bool result) {
+    if (result) {
+        Serial.println("✅ Confirmed packet transmission successful (ACK received)");
+    } else {
+        Serial.println("❌ Confirmed packet transmission failed (no ACK)");
+    }
+    state.transmissionActive = false;
+    state.lastTransmission = millis();
 }
