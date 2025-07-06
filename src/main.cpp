@@ -1,80 +1,76 @@
 /**
- * Helium Gateway Mapper - SX126x-Arduino Implementation
+ * Helium Gateway Mapper - DEBUG VERSION
  * 
  * Hardware: Heltec Wireless Tracker V1.1 (ESP32-S3 + SX1262)
  * Network: US915 LoRaWAN via Helium Network -> ChirpStack
  * 
- * Library: SX126x-Arduino by beegee-tokyo (native SX1262 support)
- * Eliminates hal_failed() crashes with proper BUSY pin handling
+ * DEBUG: Skips GPS, sends test data to verify LoRaWAN pipeline
  */
 
 #include <Arduino.h>
 #include <SX126x-Arduino.h>
 #include <LoRaWan-Arduino.h>
-#include <TinyGPS++.h>
-#include <SoftwareSerial.h>
 #include <Preferences.h>
-#include <esp_task_wdt.h>
-#include <esp_sleep.h>
+#include <esp_adc_cal.h>
 #include "secrets.h"
 
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-#define FW_VERSION "1.0.0"
+#define FIRMWARE_VERSION_MAJOR 2
+#define FIRMWARE_VERSION_MINOR 1
 
 // ============================================================================
-// HARDWARE DEFINITIONS (Heltec Wireless Tracker V1.1)
+// HARDWARE CONFIGURATION
 // ============================================================================
-// SX1262 LoRa pins
-#define LORA_CS      8    // NSS (Chip Select)
-#define LORA_RST     12   // Reset
-#define LORA_DIO1    14   // DIO1 (IRQ)
-#define LORA_BUSY    13   // BUSY pin (critical for SX1262)
-#define LORA_SCLK    9    // SPI Clock
-#define LORA_MISO    11   // SPI MISO
-#define LORA_MOSI    10   // SPI MOSI
 
-// GPS pins (V1.1 specific)
-#define GPS_RX       43   // GPS UART RX
-#define GPS_TX       44   // GPS UART TX
-#define GPS_POWER    3    // GPS power control (V1.1 specific)
+// LoRa SX1262 Pin Definitions (Heltec Wireless Tracker V1.1)
+#define LORA_CS     8   // NSS
+#define LORA_RST    12  // RESET  
+#define LORA_DIO1   14  // DIO1 (IRQ)
+#define LORA_BUSY   13  // BUSY (SX1262 specific)
+#define LORA_MISO   11  // SPI MISO
+#define LORA_MOSI   10  // SPI MOSI
+#define LORA_SCK    9   // SPI SCK
 
-// Status LEDs (remove duplicate definition)
-// #define LED_BUILTIN  35  // Already defined in board variant
+// Battery monitoring
+#define BATTERY_ADC ADC1_CHANNEL_5  // GPIO13
+#define BATTERY_VOLTAGE_DIVIDER 2.0f // Adjust based on your board
 
-// ============================================================================
-// LORAWAN CONFIGURATION
-// ============================================================================
-// Region and frequency band
-#define LORAWAN_REGION    LORAMAC_REGION_US915
-#define LORAWAN_SUBBAND   2  // US915 FSB2 (channels 8-15 + 65) for Helium
-
-// Device configuration
-#define LORAWAN_CLASS     CLASS_A
-#define LORAWAN_ADR       true
-#define LORAWAN_PUBLIC    true
-#define LORAWAN_DUTY_CYCLE false
-#define LORAWAN_DATARATE  DR_3
-#define LORAWAN_TX_POWER  14  // dBm
-#define LORAWAN_CONFIRMED false
-
-// Timing
-#define SEND_INTERVAL     120000  // 2 minutes
-#define JOIN_RETRY_DELAY  30000   // 30 seconds
+// Timing constants
+#define TRANSMISSION_INTERVAL_MS 60000  // 1 minute for debugging (was 5 minutes)
 
 // ============================================================================
-// GLOBAL OBJECTS
+// LORAWAN CONFIGURATION  
 // ============================================================================
-// GPS
-TinyGPSPlus gps;
-SoftwareSerial gpsSerial(GPS_RX, GPS_TX);
 
-// Storage
-Preferences preferences;
+// Regional settings
+#define LORAWAN_REGION       LORAMAC_REGION_US915
+#define LORAWAN_DATARATE     DR_0
+#define LORAWAN_PUBLIC       true
+#define LORAWAN_ADR          false
+#define LORAWAN_TX_POWER     TX_POWER_0
+#define LORAWAN_DUTY_CYCLE   false
 
-// Hardware configuration for SX126x-Arduino
-hw_config hwConfig;
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct TestData {
+    float latitude;           // 4 bytes - TEST DATA
+    float longitude;          // 4 bytes - TEST DATA 
+    uint16_t altitude;        // 2 bytes - TEST DATA
+    uint8_t satellites;       // 1 byte - TEST DATA
+    uint8_t hdop;            // 1 byte - TEST DATA
+    uint16_t battery_mv;      // 2 bytes - REAL BATTERY DATA
+    uint8_t packet_count;     // 1 byte - REAL COUNTER
+    uint8_t firmware_version; // 1 byte - REAL VERSION
+    // Total: 16 bytes
+} __attribute__((packed));
+
+// ============================================================================
+// GLOBAL VARIABLES
+// ============================================================================
 
 // LoRaWAN parameters
 lmh_param_t lora_param_init = {
@@ -86,59 +82,10 @@ lmh_param_t lora_param_init = {
     LORAWAN_DUTY_CYCLE
 };
 
-// Device credentials (from secrets.h)
-uint8_t nodeDeviceEUI[8];
-uint8_t nodeAppEUI[8]; 
-uint8_t nodeAppKey[16];
+// Hardware configuration
+hw_config hwConfig;
 
-// ============================================================================
-// GLOBAL STATE
-// ============================================================================
-struct GPSData {
-    float latitude = 0.0;
-    float longitude = 0.0;
-    float altitude = 0.0;
-    float hdop = 0.0;
-    uint8_t satellites = 0;
-    bool valid = false;
-};
-
-struct TrackerState {
-    GPSData gps;
-    float batteryVoltage = 0.0;
-    uint32_t lastTransmission = 0;
-    bool joined = false;
-    bool transmissionActive = false;
-    uint32_t transmissionStartTime = 0;
-    uint16_t packetCounter = 0;
-    uint8_t joinRetries = 0;
-} state;
-
-// ============================================================================
-// FUNCTION DECLARATIONS
-// ============================================================================
-// Hardware
-void initHardware();
-void initGPS();
-void initLoRa();
-void controlPeripherals(bool enable);
-
-// GPS
-bool readGPS();
-void powerGPS(bool enable);
-
-// Power
-float readBatteryVoltage();
-
-// LoRaWAN
-void startJoinProcedure();
-bool createDataPacket(uint8_t* buffer, uint8_t* size);
-
-// Status
-void updateLED();
-void printStatus();
-
-// LoRaWAN callback implementations (Board functions provided by SX126x-Arduino library)
+// Forward declarations for callbacks
 void lorawan_rx_handler(lmh_app_data_t *app_data);
 void lorawan_has_joined_handler(void);
 void lorawan_confirm_class_handler(DeviceClass_t Class);
@@ -146,410 +93,305 @@ void lorawan_join_failed_handler(void);
 void lorawan_unconfirmed_finished(void);
 void lorawan_confirmed_finished(bool result);
 
-// ============================================================================
-// LORAWAN CALLBACKS
-// ============================================================================
+// LoRaWAN callbacks structure
 static lmh_callback_t lora_callbacks = {
-    BoardGetBatteryLevel,
-    BoardGetUniqueId, 
-    BoardGetRandomSeed,
-    lorawan_rx_handler,
-    lorawan_has_joined_handler,
-    lorawan_confirm_class_handler,
-    lorawan_join_failed_handler,
-    lorawan_unconfirmed_finished,
-    lorawan_confirmed_finished
+    BoardGetBatteryLevel, BoardGetUniqueId, BoardGetRandomSeed,
+    lorawan_rx_handler, lorawan_has_joined_handler, lorawan_confirm_class_handler,
+    lorawan_join_failed_handler, lorawan_unconfirmed_finished, lorawan_confirmed_finished
 };
 
+// OTAA Keys from secrets.h  
+uint8_t nodeDeviceEUI[8];
+uint8_t nodeAppEUI[8]; 
+uint8_t nodeAppKey[16];
+
+// State variables
+bool isJoined = false;
+bool transmissionComplete = false;
+uint32_t packetCounter = 0;
+unsigned long lastTransmissionTime = 0;
+
 // ============================================================================
-// SETUP
+// FUNCTION DECLARATIONS
 // ============================================================================
+
+// Hardware
+void initHardware();
+float readBatteryVoltage();
+
+// LoRaWAN
+bool initLoRaWAN();
+void startJoinProcedure();
+
+// Application
+bool createTestDataPacket(uint8_t *buffer, uint8_t &size);
+void performDataTransmission();
+
+// ============================================================================
+// SETUP FUNCTION
+// ============================================================================
+
 void setup() {
     Serial.begin(115200);
     delay(2000);
     
+    Serial.println("\\n=== Helium Gateway Mapper - DEBUG ===");
+    Serial.printf("Firmware: %d.%d\\n", FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR);
+    Serial.println("DEBUG MODE: Skipping GPS, sending test data");
     Serial.println("=====================================");
-    Serial.println("   Helium Gateway Mapper - SX126x");
-    Serial.println("=====================================");
-    Serial.printf("Firmware: %s\n", FW_VERSION);
-    Serial.printf("Target: Heltec Wireless Tracker V1.1\n");
-    Serial.printf("Chip: ESP32-S3 + SX1262\n");
-    Serial.println("=====================================");
-
+    
     // Initialize hardware
+    Serial.println("1. Initializing hardware...");
     initHardware();
+    Serial.println("   Hardware init complete");
     
-    // Initialize GPS
-    initGPS();
-    
-    // Initialize LoRa/LoRaWAN
-    initLoRa();
-    
-    // Print initial status
-    printStatus();
-    
-    // Start join procedure if not already joined
-    if (!state.joined) {
-        Serial.println("Starting LoRaWAN join procedure...");
-        startJoinProcedure();
-    }
-    
-    Serial.println("Setup complete. Entering main loop...");
-}
-
-// ============================================================================
-// MAIN LOOP
-// ============================================================================
-void loop() {
-    // Update GPS data
-    readGPS();
-    
-    // Update battery voltage
-    state.batteryVoltage = readBatteryVoltage();
-    
-    // Handle transmission timing
-    if (state.joined && !state.transmissionActive) {
-        if (millis() - state.lastTransmission > SEND_INTERVAL) {
-            // Time to send a packet
-            if (state.gps.valid) {
-                uint8_t buffer[32];
-                uint8_t size;
-                
-                if (createDataPacket(buffer, &size)) {
-                    Serial.println("\n--- Sending LoRaWAN Packet ---");
-                    Serial.printf("GPS: %.6f,%.6f Alt:%.1fm HDOP:%.1f Sats:%d\n",
-                        state.gps.latitude, state.gps.longitude, 
-                        state.gps.altitude, state.gps.hdop, state.gps.satellites);
-                    Serial.printf("Battery: %.2fV\n", state.batteryVoltage);
-                    Serial.printf("Packet size: %d bytes\n", size);
-                    
-                    // Prepare packet structure
-                    lmh_app_data_t app_data = {
-                        .buffer = buffer,
-                        .buffsize = size,
-                        .port = 1,
-                        .rssi = 0,
-                        .snr = 0
-                    };
-                    
-                    // Send the packet
-                    lmh_error_status result = lmh_send(&app_data, LMH_UNCONFIRMED_MSG);
-                    if (result == LMH_SUCCESS) {
-                        state.transmissionActive = true;
-                        state.transmissionStartTime = millis();
-                        state.packetCounter++;
-                        Serial.println("Packet queued for transmission");
-                    } else {
-                        Serial.printf("Failed to queue packet: %d\n", result);
-                    }
-                } else {
-                    Serial.println("Failed to create data packet");
-                }
-            } else {
-                Serial.println("Skipping transmission - no valid GPS fix");
-                state.lastTransmission = millis(); // Reset timer
-            }
-        }
-    }
-    
-    // Handle join retry timing
-    if (!state.joined && (millis() > JOIN_RETRY_DELAY * (state.joinRetries + 1))) {
-        Serial.printf("Join retry %d...\n", state.joinRetries + 1);
-        startJoinProcedure();
-        state.joinRetries++;
+    // Initialize LoRaWAN
+    Serial.println("2. Initializing LoRaWAN...");
+    if (initLoRaWAN()) {
+        Serial.println("   LoRaWAN init complete");
         
-        if (state.joinRetries >= 10) {
-            Serial.println("Too many join failures, restarting...");
-            ESP.restart();
+        Serial.println("3. Starting join procedure...");
+        startJoinProcedure();
+        
+        // Wait for join with timeout
+        Serial.println("4. Waiting for network join...");
+        unsigned long joinStart = millis();
+        while (!isJoined && (millis() - joinStart) < 60000) {
+            delay(1000);
+            Serial.print(".");
         }
+        Serial.println();
+        
+        if (isJoined) {
+            Serial.println("5. ✅ JOIN SUCCESS! Starting data transmission...");
+            lastTransmissionTime = millis();
+            performDataTransmission();
+        } else {
+            Serial.println("5. ❌ JOIN FAILED - will retry...");
+        }
+    } else {
+        Serial.println("   ❌ LoRaWAN init failed");
     }
     
-    // Handle transmission timeout
-    if (state.transmissionActive && (millis() - state.transmissionStartTime > 30000)) {
-        Serial.println("Transmission timeout, resetting state");
-        state.transmissionActive = false;
-        state.lastTransmission = millis();
+    Serial.println("6. Setup complete - entering main loop");
+}
+
+void loop() {
+    // Send data every minute in debug mode
+    if (isJoined && (millis() - lastTransmissionTime) > TRANSMISSION_INTERVAL_MS) {
+        Serial.println("\\n🔄 Starting periodic transmission...");
+        performDataTransmission();
+        lastTransmissionTime = millis();
     }
     
-    // Update status LED
-    updateLED();
-    
-    // Brief delay to prevent watchdog issues
-    delay(100);
+    delay(1000);
 }
 
 // ============================================================================
-// HARDWARE INITIALIZATION
+// HARDWARE FUNCTIONS
 // ============================================================================
+
 void initHardware() {
-    Serial.println("Initializing hardware...");
-    
-    // Configure LED
+    // Initialize LED
     pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
+    digitalWrite(LED_BUILTIN, HIGH); // LED on during init
     
-    // Initialize preferences
-    preferences.begin("tracker", false);
-    
-    // Control peripherals (start with GPS on for initial fix)
-    controlPeripherals(true);
-    
-    Serial.println("Hardware initialization complete");
-}
-
-void initGPS() {
-    Serial.println("Initializing GPS...");
-    
-    // Power on GPS
-    powerGPS(true);
-    delay(100);
-    
-    // Start GPS serial
-    gpsSerial.begin(9600);
-    
-    Serial.println("GPS initialization complete");
-}
-
-void initLoRa() {
-    Serial.println("Initializing LoRa/LoRaWAN...");
-    
-    // Initialize device credentials from secrets.h
-    memcpy(nodeDeviceEUI, DEVEUI, 8);
-    memcpy(nodeAppEUI, APPEUI, 8);
-    memcpy(nodeAppKey, APPKEY, 16);
-    
-    // Configure hardware for SX126x-Arduino library
+    // Configure SX1262 hardware
     hwConfig.CHIP_TYPE = SX1262_CHIP;
     hwConfig.PIN_LORA_RESET = LORA_RST;
     hwConfig.PIN_LORA_NSS = LORA_CS;
-    hwConfig.PIN_LORA_SCLK = LORA_SCLK;
+    hwConfig.PIN_LORA_SCLK = LORA_SCK;
     hwConfig.PIN_LORA_MISO = LORA_MISO;
+    hwConfig.PIN_LORA_MOSI = LORA_MOSI;
     hwConfig.PIN_LORA_DIO_1 = LORA_DIO1;
     hwConfig.PIN_LORA_BUSY = LORA_BUSY;
-    hwConfig.PIN_LORA_MOSI = LORA_MOSI;
-    hwConfig.RADIO_TXEN = -1;      // Not used on this board
-    hwConfig.RADIO_RXEN = -1;      // Not used on this board
-    hwConfig.USE_DIO2_ANT_SWITCH = false;
-    hwConfig.USE_DIO3_TCXO = true;  // Heltec boards use DIO3 for TCXO
+    hwConfig.RADIO_TXEN = -1;   // Not used
+    hwConfig.RADIO_RXEN = -1;   // Not used
+    hwConfig.USE_DIO2_ANT_SWITCH = true;
+    hwConfig.USE_DIO3_TCXO = true;
     hwConfig.USE_DIO3_ANT_SWITCH = false;
-    hwConfig.USE_LDO = false;       // Use DCDC converter
-    hwConfig.USE_RXEN_ANT_PWR = false;
     
-    // Initialize LoRa hardware
-    if (lora_hardware_init(hwConfig) != 0) {
-        Serial.println("ERROR: LoRa hardware initialization failed!");
-        return;
-    }
-    
-    // Set up credentials
-    lmh_setDevEui(nodeDeviceEUI);
-    lmh_setAppEui(nodeAppEUI);
-    lmh_setAppKey(nodeAppKey);
-    
-    // Initialize LoRaWAN
-    if (lmh_init(&lora_callbacks, lora_param_init, true, LORAWAN_CLASS, LORAWAN_REGION) != LMH_SUCCESS) {
-        Serial.println("ERROR: LoRaWAN initialization failed!");
-        return;
-    }
-    
-    // Set subband for US915 (Helium uses FSB2)
-    if (!lmh_setSubBandChannels(LORAWAN_SUBBAND)) {
-        Serial.println("ERROR: Failed to set subband!");
-        return;
-    }
-    
-    Serial.println("LoRa/LoRaWAN initialization complete");
-}
-
-// ============================================================================
-// GPS FUNCTIONS
-// ============================================================================
-bool readGPS() {
-    bool newData = false;
-    
-    while (gpsSerial.available()) {
-        if (gps.encode(gpsSerial.read())) {
-            newData = true;
-        }
-    }
-    
-    if (newData && gps.location.isValid()) {
-        state.gps.latitude = gps.location.lat();
-        state.gps.longitude = gps.location.lng();
-        state.gps.altitude = gps.altitude.meters();
-        state.gps.hdop = gps.hdop.hdop();
-        state.gps.satellites = gps.satellites.value();
-        state.gps.valid = true;
-        return true;
-    }
-    
-    return false;
-}
-
-void powerGPS(bool enable) {
-    digitalWrite(GPS_POWER, enable ? HIGH : LOW);
-    if (enable) {
-        delay(100); // Allow GPS module to stabilize
-    }
-}
-
-// ============================================================================
-// POWER MANAGEMENT
-// ============================================================================
-void controlPeripherals(bool enable) {
-    // For now, just control GPS power
-    powerGPS(enable);
+    digitalWrite(LED_BUILTIN, LOW); // LED off after init
 }
 
 float readBatteryVoltage() {
-    // ESP32-S3 ADC reading for battery voltage
-    // This may need calibration based on actual hardware
-    uint32_t raw = analogRead(A0);
-    float voltage = (raw * 3.3 * 2.0) / 4095.0; // Assuming 2:1 voltage divider
+    // Configure ADC
+    esp_adc_cal_characteristics_t adc_chars;
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12, 0, &adc_chars);
+    
+    // Take multiple readings for stability
+    uint32_t voltage_sum = 0;
+    for (int i = 0; i < 10; i++) {
+        voltage_sum += esp_adc_cal_raw_to_voltage(adc1_get_raw(BATTERY_ADC), &adc_chars);
+        delay(1);
+    }
+    
+    float voltage = (voltage_sum / 10.0f) * BATTERY_VOLTAGE_DIVIDER / 1000.0f; // Convert to volts
+    Serial.printf("   Battery: %.2fV\\n", voltage);
     return voltage;
 }
 
 // ============================================================================
 // LORAWAN FUNCTIONS
 // ============================================================================
-void startJoinProcedure() {
-    lmh_join();
-    Serial.println("Join procedure started...");
-}
 
-bool createDataPacket(uint8_t* buffer, uint8_t* size) {
-    if (!state.gps.valid) {
+bool initLoRaWAN() {
+    // Initialize OTAA keys
+    memcpy(nodeDeviceEUI, DEVEUI, 8);
+    memcpy(nodeAppEUI, APPEUI, 8);
+    memcpy(nodeAppKey, APPKEY, 16);
+    
+    // Initialize hardware
+    uint32_t err_code = lora_hardware_init(hwConfig);
+    if (err_code != 0) {
+        Serial.printf("   ❌ LoRa hardware init failed: %d\\n", err_code);
         return false;
     }
+    Serial.println("   LoRa hardware init OK");
     
-    // Create binary packet (16 bytes total)
-    // Format: [Lat(4)] [Lon(4)] [Alt(2)] [HDOP(2)] [Sats(1)] [Battery(2)] [Counter(1)]
+    // Initialize LoRaWAN stack
+    err_code = lmh_init(&lora_callbacks, lora_param_init, true, CLASS_A, LORAWAN_REGION);
+    if (err_code != 0) {
+        Serial.printf("   ❌ LoRaWAN stack init failed: %d\\n", err_code);
+        return false;
+    }
+    Serial.println("   LoRaWAN stack init OK");
     
-    int32_t lat = (int32_t)(state.gps.latitude * 1e7);
-    int32_t lon = (int32_t)(state.gps.longitude * 1e7);
-    int16_t alt = (int16_t)(state.gps.altitude);
-    uint16_t hdop = (uint16_t)(state.gps.hdop * 100);
-    uint8_t sats = state.gps.satellites;
-    uint16_t battery = (uint16_t)(state.batteryVoltage * 100);
-    uint8_t counter = state.packetCounter & 0xFF;
+    // Set device keys
+    lmh_setDevEui(nodeDeviceEUI);
+    lmh_setAppEui(nodeAppEUI);
+    lmh_setAppKey(nodeAppKey);
+    Serial.println("   Device keys configured");
     
-    uint8_t idx = 0;
-    
-    // Latitude (4 bytes, little endian)
-    buffer[idx++] = (lat >> 0) & 0xFF;
-    buffer[idx++] = (lat >> 8) & 0xFF;
-    buffer[idx++] = (lat >> 16) & 0xFF;
-    buffer[idx++] = (lat >> 24) & 0xFF;
-    
-    // Longitude (4 bytes, little endian)  
-    buffer[idx++] = (lon >> 0) & 0xFF;
-    buffer[idx++] = (lon >> 8) & 0xFF;
-    buffer[idx++] = (lon >> 16) & 0xFF;
-    buffer[idx++] = (lon >> 24) & 0xFF;
-    
-    // Altitude (2 bytes, little endian)
-    buffer[idx++] = (alt >> 0) & 0xFF;
-    buffer[idx++] = (alt >> 8) & 0xFF;
-    
-    // HDOP (2 bytes, little endian)
-    buffer[idx++] = (hdop >> 0) & 0xFF;
-    buffer[idx++] = (hdop >> 8) & 0xFF;
-    
-    // Satellites (1 byte)
-    buffer[idx++] = sats;
-    
-    // Battery voltage (2 bytes, little endian)
-    buffer[idx++] = (battery >> 0) & 0xFF;
-    buffer[idx++] = (battery >> 8) & 0xFF;
-    
-    // Packet counter (1 byte)
-    buffer[idx++] = counter;
-    
-    *size = idx;
     return true;
 }
 
-// ============================================================================
-// STATUS FUNCTIONS
-// ============================================================================
-void updateLED() {
-    static uint32_t lastBlink = 0;
-    static bool ledState = false;
-    
-    if (millis() - lastBlink > 1000) {
-        if (state.joined) {
-            // Slow blink when joined
-            digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
-            ledState = !ledState;
-        } else {
-            // Fast blink when joining
-            digitalWrite(LED_BUILTIN, (millis() / 200) % 2 ? HIGH : LOW);
-        }
-        lastBlink = millis();
-    }
+void startJoinProcedure() {
+    lmh_join();
+    Serial.println("   Join request sent");
 }
 
-void printStatus() {
-    Serial.println("\n--- Tracker Status ---");
-    Serial.printf("Joined: %s\n", state.joined ? "Yes" : "No");
-    Serial.printf("GPS Valid: %s\n", state.gps.valid ? "Yes" : "No");
-    if (state.gps.valid) {
-        Serial.printf("GPS: %.6f,%.6f Alt:%.1fm\n", 
-            state.gps.latitude, state.gps.longitude, state.gps.altitude);
-        Serial.printf("HDOP: %.1f Satellites: %d\n", state.gps.hdop, state.gps.satellites);
-    }
-    Serial.printf("Battery: %.2fV\n", state.batteryVoltage);
-    Serial.printf("Packets sent: %d\n", state.packetCounter);
-    Serial.println("---------------------\n");
-}
-
-// ============================================================================
-// LORAWAN CALLBACK IMPLEMENTATIONS  
-// ============================================================================
-// Note: BoardGetBatteryLevel(), BoardGetUniqueId(), and BoardGetRandomSeed() 
-// are provided by the SX126x-Arduino library
-
+// LoRaWAN Callbacks
 void lorawan_rx_handler(lmh_app_data_t *app_data) {
-    Serial.println("LoRa packet received:");
-    Serial.printf("Port: %d\n", app_data->port);
-    Serial.printf("Size: %d\n", app_data->buffsize);
-    Serial.print("Data: ");
-    for (int i = 0; i < app_data->buffsize; i++) {
-        Serial.printf("%02X ", app_data->buffer[i]);
-    }
-    Serial.println();
+    Serial.printf("📥 Received downlink: port %d, size %d\\n", app_data->port, app_data->buffsize);
 }
 
 void lorawan_has_joined_handler(void) {
-    Serial.println("✅ OTAA join succeeded!");
-    state.joined = true;
-    state.joinRetries = 0;
-    state.lastTransmission = millis(); // Reset transmission timer
-    printStatus();
+    Serial.println("🎉 NETWORK JOINED SUCCESSFULLY!");
+    isJoined = true;
+    
+    // Blink LED to indicate success
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_BUILTIN, HIGH);
+        delay(200);
+        digitalWrite(LED_BUILTIN, LOW);
+        delay(200);
+    }
 }
 
 void lorawan_confirm_class_handler(DeviceClass_t Class) {
-    Serial.printf("Class changed to: %c\n", "ABC"[Class]);
+    Serial.printf("📋 Device class confirmed: %d\\n", Class);
 }
 
 void lorawan_join_failed_handler(void) {
-    Serial.println("❌ OTAA join failed");
-    state.joined = false;
-    // Will retry automatically in main loop
+    Serial.println("❌ JOIN FAILED!");
+    isJoined = false;
 }
 
 void lorawan_unconfirmed_finished(void) {
-    Serial.println("Unconfirmed packet transmission finished");
-    state.transmissionActive = false;
-    state.lastTransmission = millis();
+    Serial.println("📤 Unconfirmed message sent successfully");
+    transmissionComplete = true;
 }
 
 void lorawan_confirmed_finished(bool result) {
-    if (result) {
-        Serial.println("✅ Confirmed packet transmission successful (ACK received)");
+    Serial.printf("📤 Confirmed message sent: %s\\n", result ? "SUCCESS" : "FAILED");
+    transmissionComplete = true;
+}
+
+// ============================================================================
+// APPLICATION FUNCTIONS
+// ============================================================================
+
+bool createTestDataPacket(uint8_t *buffer, uint8_t &size) {
+    TestData data;
+    
+    // Create test GPS data (simulate San Francisco area)
+    data.latitude = 37.7749f + (packetCounter * 0.0001f);  // Slightly different each time
+    data.longitude = -122.4194f + (packetCounter * 0.0001f);
+    data.altitude = 100 + (packetCounter % 50);  // 100-150m
+    data.satellites = 8 + (packetCounter % 4);   // 8-11 satellites
+    data.hdop = 10 + (packetCounter % 20);       // HDOP 1.0-3.0 (stored as *10)
+    
+    // Real battery data
+    float batteryV = readBatteryVoltage();
+    data.battery_mv = (uint16_t)(batteryV * 1000.0f);
+    
+    // Real device info
+    data.packet_count = (uint8_t)(packetCounter & 0xFF);
+    data.firmware_version = (FIRMWARE_VERSION_MAJOR << 4) | FIRMWARE_VERSION_MINOR;
+    
+    // Copy to buffer
+    memcpy(buffer, &data, sizeof(TestData));
+    size = sizeof(TestData);
+    
+    Serial.printf("📦 Test packet #%d created (%d bytes):\\n", packetCounter, size);
+    Serial.printf("   GPS: %.4f, %.4f, %dm\\n", data.latitude, data.longitude, data.altitude);
+    Serial.printf("   Sats: %d, HDOP: %.1f\\n", data.satellites, data.hdop / 10.0f);
+    Serial.printf("   Battery: %dmV, FW: %d.%d\\n", 
+                  data.battery_mv, 
+                  (data.firmware_version >> 4) & 0xF, 
+                  data.firmware_version & 0xF);
+    
+    return true;
+}
+
+void performDataTransmission() {
+    uint8_t buffer[32];
+    uint8_t size;
+    
+    Serial.println("📡 Starting data transmission...");
+    
+    if (createTestDataPacket(buffer, size)) {
+        // Prepare packet structure
+        lmh_app_data_t app_data = {
+            .buffer = buffer,
+            .buffsize = size,
+            .port = 1,
+            .rssi = 0,
+            .snr = 0
+        };
+        
+        packetCounter++;
+        Serial.printf("📤 Sending packet #%d...\\n", packetCounter);
+        transmissionComplete = false;
+        
+        // Send the packet
+        lmh_error_status result = lmh_send(&app_data, LMH_UNCONFIRMED_MSG);
+        if (result == LMH_SUCCESS) {
+            Serial.println("   ✅ Packet queued successfully");
+            
+            // Wait for transmission to complete
+            unsigned long txStart = millis();
+            while (!transmissionComplete && (millis() - txStart) < 30000) {
+                delay(100);
+            }
+            
+            if (transmissionComplete) {
+                Serial.println("   ✅ Transmission completed successfully!");
+                
+                // Blink LED to indicate success
+                digitalWrite(LED_BUILTIN, HIGH);
+                delay(100);
+                digitalWrite(LED_BUILTIN, LOW);
+            } else {
+                Serial.println("   ⚠️ Transmission timeout");
+            }
+        } else {
+            Serial.printf("   ❌ Failed to queue packet: %d\\n", result);
+        }
     } else {
-        Serial.println("❌ Confirmed packet transmission failed (no ACK)");
+        Serial.println("   ❌ Failed to create packet");
     }
-    state.transmissionActive = false;
-    state.lastTransmission = millis();
+    
+    Serial.println("📡 Transmission cycle complete\\n");
 }

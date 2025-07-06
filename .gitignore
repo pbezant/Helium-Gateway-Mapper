@@ -6,6 +6,7 @@
 
 # LoRaWAN device secrets - NEVER COMMIT
 include/secrets.h
+logs/*.json
 
 # Other sensitive files
 *.key
