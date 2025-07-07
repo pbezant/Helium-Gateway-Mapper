@@ -31,10 +31,11 @@
 #define LORA_DIO1   14  // DIO1 (IRQ)
 #define LORA_BUSY   13  // BUSY (SX1262 specific)
 
-// GPS Pin Definitions (Heltec Wireless Tracker V1.1)
-#define GPS_RX      43  // GPS RX (V1.1 specific)
-#define GPS_TX      44  // GPS TX (V1.1 specific)  
-#define GPS_POWER   3   // GPS Power Control (V1.1 critical)
+// GPS Configuration - Heltec Wireless Tracker V1.1 Correct Pins
+#define GPS_POWER 3        // GPIO3 - V1.1 GPS power control pin
+#define GPS_RX 16          // GPIO16 - GPS RX pin (ESP32 receives from GPS)
+#define GPS_TX 17          // GPIO17 - GPS TX pin (ESP32 transmits to GPS)
+#define GPS_BAUD_RATE 9600 // UC6580 GPS module baud rate
 
 // LED Pin Definition (Heltec Wireless Tracker V1.1)
 #define LED_BUILTIN 35  // Built-in LED for Heltec V1.1
@@ -46,7 +47,7 @@
 // Timing constants
 #define TRANSMISSION_INTERVAL_MS 300000  // 5 minutes for real deployment
 #define JOIN_TIMEOUT_MS 60000           // 1 minute join timeout
-#define GPS_TIMEOUT_MS 60000            // 1 minute GPS timeout
+#define GPS_TIMEOUT_MS 300000           // 5 minutes GPS timeout for outdoor acquisition
 #define GPS_BAUD_RATE 9600              // Standard GPS baud rate
 
 // ============================================================================
@@ -66,7 +67,7 @@ String nwkKeyHex = "E3EE86C89D7D5FB1FAE4C733E7BED2D8";  // Same as AppKey for Lo
 // ============================================================================
 
 // GPS hardware
-HardwareSerial gpsSerial(1);  // Use UART1 for GPS
+HardwareSerial gpsSerial(2);  // Use UART2 for GPS with explicit pins
 TinyGPSPlus gps;
 
 // GPS fix quality enum
@@ -130,7 +131,6 @@ void powerOnGPS();
 void powerOffGPS();
 bool acquireGPSFix(GPSData &data, uint32_t timeoutMs);
 GPSFixQuality getGPSFixQuality();
-
 // LoRaWAN
 bool initLoRaWAN();
 bool joinNetwork();
@@ -267,49 +267,63 @@ float readBatteryVoltage() {
 // ============================================================================
 
 void initGPS() {
-    // Initialize GPS serial communication
-    gpsSerial.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX, GPS_TX);
-    Serial.printf("   📍 GPS UART configured: RX=%d, TX=%d, Baud=%d\n", GPS_RX, GPS_TX, GPS_BAUD_RATE);
+    // GPS uses explicit UART pins for V1.1 hardware
+    Serial.println("   📍 GPS UART configured: RX=16, TX=17, Baud=9600");
 }
 
+
+
 void powerOnGPS() {
-    digitalWrite(GPS_POWER, HIGH);  // Turn on GPS power
-    Serial.println("   🔋 GPS powered ON");
-    delay(1000);  // Give GPS time to boot up
+    pinMode(GPS_POWER, OUTPUT);
+    digitalWrite(GPS_POWER, HIGH);  // HIGH = Power ON for V1.1 hardware
+    Serial.println("   🔋 GPS powered ON (GPIO3 set HIGH)");
+    delay(200); // Give power rail time to stabilize
 }
 
 void powerOffGPS() {
-    digitalWrite(GPS_POWER, LOW);   // Turn off GPS power
-    Serial.println("   🔋 GPS powered OFF");
+    digitalWrite(GPS_POWER, LOW);   // LOW = Power OFF for V1.1 hardware
+    Serial.println("   🔋 GPS powered OFF (GPIO3 set LOW)");
 }
 
 bool acquireGPSFix(GPSData &data, uint32_t timeoutMs) {
     powerOnGPS();
     
-    unsigned long startTime = millis();
-    bool fixAcquired = false;
+    // Initialize GPS serial AFTER powering on with V1.1 specific pins
+    gpsSerial.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX, GPS_TX);
+    Serial.println("   📍 GPS UART initialized: RX=16, TX=17, Baud=9600");
+    
+    // GPS initialization delay
+    Serial.println("   ⏳ Waiting for UC6580 initialization...");
+    delay(2000);
     
     Serial.printf("   🛰️  Acquiring GPS fix (timeout: %d seconds)...\n", timeoutMs / 1000);
     
+    unsigned long startTime = millis();
+    unsigned long lastStatusTime = startTime;
+    bool fixAcquired = false;
+    int bytesReceived = 0;
+    int validSentences = 0;
+    
     while (millis() - startTime < timeoutMs) {
-        while (gpsSerial.available() > 0) {
-            if (gps.encode(gpsSerial.read())) {
-                // Check if we have a valid fix
-                if (gps.location.isValid() && 
-                    gps.location.isUpdated() &&
-                    gps.satellites.isValid() && 
-                    gps.satellites.value() >= 4 &&  // Minimum 4 satellites for good fix
-                    gps.hdop.isValid() && 
-                    gps.hdop.value() < 500) {  // HDOP < 5.0 (stored as x100)
+        while (gpsSerial.available()) {
+            char c = gpsSerial.read();
+            bytesReceived++;
+            
+            if (gps.encode(c)) {
+                validSentences++;
+                // Check for valid fix with minimum requirements
+                if (gps.location.isUpdated() && gps.location.isValid() &&
+                    gps.satellites.isUpdated() && gps.satellites.isValid() && gps.satellites.value() >= 3 &&
+                    gps.hdop.isUpdated() && gps.hdop.isValid() && gps.hdop.value() <= 500) {
                     
-                    // Extract GPS data
+                    fixAcquired = true;
                     data.latitude = gps.location.lat();
                     data.longitude = gps.location.lng();
                     data.altitude = gps.altitude.isValid() ? (uint16_t)gps.altitude.meters() : 0;
                     data.satellites = gps.satellites.value();
-                    data.hdop = (uint8_t)(gps.hdop.value() / 10);  // Scale to fit in uint8_t
+                    data.hdop = gps.hdop.isValid() ? (uint8_t)(gps.hdop.hdop() * 10) : 99;
                     
-                    // Update last known location
+                    // Update Last Known Location
                     lastKnownGPS.valid = true;
                     lastKnownGPS.latitude = data.latitude;
                     lastKnownGPS.longitude = data.longitude;
@@ -318,29 +332,42 @@ bool acquireGPSFix(GPSData &data, uint32_t timeoutMs) {
                     lastKnownGPS.hdop = data.hdop;
                     lastKnownGPS.timestamp = millis();
                     
-                    fixAcquired = true;
+                    Serial.printf("   🎉 GPS fix acquired! Lat: %.6f, Lon: %.6f, Sats: %d\n",
+                                 data.latitude, data.longitude, data.satellites);
                     break;
                 }
             }
         }
+        
         if (fixAcquired) break;
         
-        // Blink LED during GPS acquisition
-        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-        delay(250);
+        // Status update every 15 seconds
+        if (millis() - lastStatusTime >= 15000) {
+            Serial.printf("   📊 GPS Status: %d bytes, %d sentences, %d satellites visible\n",
+                         bytesReceived, validSentences, gps.satellites.value());
+            lastStatusTime = millis();
+        }
+        
+        delay(100);
     }
     
-    digitalWrite(LED_BUILTIN, LOW); // Turn off LED
-    powerOffGPS(); // Save power
+    gpsSerial.end();
+    powerOffGPS();
     
     if (fixAcquired) {
-        Serial.printf("   ✅ GPS fix acquired: %.6f, %.6f (%d sats, HDOP: %.1f)\n", 
-                     data.latitude, data.longitude, data.satellites, data.hdop / 10.0f);
+        Serial.println("   ✅ GPS fix acquired successfully");
+        return true;
     } else {
-        Serial.println("   ❌ GPS fix timeout - no valid position");
+        Serial.printf("   ❌ GPS fix failed - %d bytes, %d sentences, %d satellites\n",
+                     bytesReceived, validSentences, gps.satellites.value());
+        
+        if (bytesReceived > 0) {
+            Serial.println("   📡 GPS communication working but no fix acquired");
+        } else {
+            Serial.println("   🔧 No GPS communication detected");
+        }
+        return false;
     }
-    
-    return fixAcquired;
 }
 
 GPSFixQuality getGPSFixQuality() {
